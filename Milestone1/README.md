@@ -1,4 +1,4 @@
-Milestone 1 — User Authentication System
+<img width="578" height="434" alt="Screenshot 2026-10-23 184346" src="https://github.com/user-attachments/assets/b4eb0bbd-1db2-4db6-af55-d737725005da" />Milestone 1 — User Authentication System
 
 Project Overview
 
@@ -36,6 +36,10 @@ Screenshots
 Screenshots of the completed application will be added here.
 
 - Login Page
+<img width="578" height="434" alt="Screenshot 2026-10-23 184346" src="https://github.com/user-attachments/assets/abfb0433-1076-472b-8e16-49eb2c82f326" />
+
+
+  
 - Signup Page
 - Forgot Password — Security Question
 - Forgot Password — OTP
