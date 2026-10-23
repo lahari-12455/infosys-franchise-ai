@@ -1,5 +1,3 @@
-<img width="578" height="434" alt="Screenshot 2026-10-23 184346" src="https://github.com/user-attachments/assets/b4eb0bbd-1db2-4db6-af55-d737725005da" />Milestone 1 — User Authentication System
-
 Project Overview
 
 This project implements a user authentication system as part of the Infosys Springboard Internship 7.0, Batch 4, Milestone 1.
@@ -41,8 +39,5 @@ Screenshots of the completed application will be added here.
 
   
 - Signup Page
-- Forgot Password — Security Question
-- Forgot Password — OTP
-- OTP Email
-- User Dashboard
-- Admin Dashboard
+<img width="398" height="398" alt="Screenshot 2026-10-23 185115" src="https://github.com/user-attachments/assets/b23cf164-cfde-41b3-bed0-01c815534196" />
+
