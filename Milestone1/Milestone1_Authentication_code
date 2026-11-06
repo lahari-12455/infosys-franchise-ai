@@ -1,0 +1,526 @@
+!pip install streamlit-option-menu pyngrok bcrypt PyJWT
+%%writefile db.py
+import sqlite3
+import bcrypt
+import datetime
+import time
+
+DB_NAME = "users.db"
+max_login_attempts = 3
+lockout_time = 300  # 5 minutes in seconds
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (email TEXT PRIMARY KEY,
+                  password BLOB,
+                  created_at TEXT,
+                  security_question TEXT,
+                  security_answer BLOB)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS password_history
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  email TEXT,
+                  password BLOB,
+                  set_at TEXT,
+                  FOREIGN KEY(email) REFERENCES users(email))''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS login_attempts
+                 (email TEXT PRIMARY KEY, attempts INTEGER, last_attempt REAL)''')
+
+    conn.commit()
+    conn.close()
+    init_admin()
+
+def init_admin():
+    if not check_user_exists("admin@llm.com"):
+        register_user("admin@llm.com", "Admin@123", "What is your pet name?", "admin")
+        print("Admin account created.")
+
+def _get_timestamp():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def get_login_attempts(email):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT attempts, last_attempt FROM login_attempts WHERE email = ?", (email,))
+    data = c.fetchone()
+    conn.close()
+    return data if data else (0, 0)
+
+def increment_login_attempts(email):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    attempts, _ = get_login_attempts(email)
+    new_attempts = attempts + 1
+    now = time.time()
+    c.execute("INSERT OR REPLACE INTO login_attempts (email, attempts, last_attempt) VALUES (?, ?, ?)",
+              (email, new_attempts, now))
+    conn.commit()
+    conn.close()
+
+def reset_login_attempts(email):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM login_attempts WHERE email = ?", (email,))
+    conn.commit()
+    conn.close()
+
+def is_rate_limited(email):
+    attempts, last_attempt = get_login_attempts(email)
+    if attempts >= max_login_attempts:
+        if time.time() - last_attempt < lockout_time:
+            return True, lockout_time - (time.time() - last_attempt)
+        else:
+            reset_login_attempts(email)
+    return False, 0
+
+def register_user(email, password, sec_question="", sec_answer=""):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        salt = bcrypt.gensalt()
+        hashed_pass = bcrypt.hashpw(password.encode('utf-8'), salt)
+        hashed_ans = bcrypt.hashpw(sec_answer.strip().lower().encode('utf-8'), salt) if sec_answer else b""
+        now = _get_timestamp()
+
+        c.execute("INSERT INTO users (email, password, created_at, security_question, security_answer) VALUES (?, ?, ?, ?, ?)",
+                  (email, hashed_pass, now, sec_question, hashed_ans))
+        c.execute("INSERT INTO password_history (email, password, set_at) VALUES (?, ?, ?)",
+                  (email, hashed_pass, now))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def authenticate_user(email, password):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT password FROM users WHERE email = ?", (email,))
+    data = c.fetchone()
+    conn.close()
+    if data:
+        stored_hash = data[0]
+        if bcrypt.checkpw(password.encode('utf-8'), stored_hash):
+            reset_login_attempts(email)
+            return True
+    increment_login_attempts(email)
+    return False
+
+def get_security_question(email):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT security_question FROM users WHERE email = ?", (email,))
+    data = c.fetchone()
+    conn.close()
+    return data[0] if data else None
+
+def verify_security_answer(email, answer):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT security_answer FROM users WHERE email = ?", (email,))
+    data = c.fetchone()
+    conn.close()
+    if data and data[0]:
+        return bcrypt.checkpw(answer.strip().lower().encode('utf-8'), data[0])
+    return False
+
+def check_password_reused(email, new_password):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT password FROM password_history WHERE email = ?", (email,))
+    history = c.fetchall()
+    conn.close()
+    for (stored_hash,) in history:
+        if bcrypt.checkpw(new_password.encode('utf-8'), stored_hash):
+            return True
+    return False
+
+def check_user_exists(email):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM users WHERE email = ?", (email,))
+    data = c.fetchone()
+    conn.close()
+    return data is not None
+
+def update_password(email, new_password):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(new_password.encode('utf-8'), salt)
+    now = _get_timestamp()
+    c.execute("UPDATE users SET password = ? WHERE email = ?", (hashed, email))
+    c.execute("INSERT INTO password_history (email, password, set_at) VALUES (?, ?, ?)", (email, hashed, now))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT email, created_at FROM users")
+    data = c.fetchall()
+    conn.close()
+    return data
+
+%%writefile app.py
+import os, jwt, bcrypt, datetime, time, secrets, smtplib, streamlit as st
+import plotly.graph_objects as go
+from streamlit_option_menu import option_menu
+from email.utils import formatdate, make_msgid
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import db
+
+db.init_db()
+
+os.makedirs(".streamlit", exist_ok=True)
+with open(".streamlit/config.toml", "w") as f:
+    f.write('[theme]\nbase="light"\nprimaryColor="#ffd803"\nbackgroundColor="#f9fcfc"\nsecondaryBackgroundColor="#e3f6f5"\ntextColor="#2d334a"\n')
+
+st.set_page_config(page_title="Infosys Portal", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
+
+COLORS = {
+    "bg_main": "#f9fcfc", "bg_sidebar": "#e3f6f5", "bg_card": "#ffffff", "bg_card_alt": "#bae8e8",
+    "text_main": "#2d334a", "text_heading": "#272343", "text_muted": "#64748b",
+    "accent": "#ffd803", "accent_hover": "#e6c300", "accent_text": "#272343",
+    "border": "#272343", "border_light": "#bae8e8", "success": "#34d399", "danger": "#f87171"
+}
+
+JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-infosys-key-2026")
+SENDER_EMAIL = os.getenv("EMAIL_ADDRESS", "")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
+OTP_EXPIRY_MINUTES = 5
+
+st.markdown(f"""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Inter:wght@300;400;500;600&display=swap');
+    html, body, .stApp {{ background: {COLORS['bg_main']} !important; font-family: 'Inter', sans-serif !important; color: {COLORS['text_main']} !important; }}
+    footer, div[data-testid="stDecoration"] {{ visibility: hidden !important; display: none !important; }}
+    header {{ background: transparent !important; z-index: 999999 !important; }}
+    button[kind="header"], div[data-testid="stSidebarCollapsedControl"] button {{
+        visibility: visible !important; display: flex !important; opacity: 1 !important;
+        background-color: {COLORS['accent']} !important; border: 2px solid {COLORS['border']} !important;
+        border-radius: 8px !important; padding: 6px !important; margin: 8px !important;
+        box-shadow: 3px 3px 0px {COLORS['border']} !important;
+    }}
+    .block-container {{ padding: 2rem 2.5rem !important; max-width: 1200px; }}
+    h1, h2, h3, h4 {{ font-family: 'Poppins', sans-serif !important; color: {COLORS['text_heading']} !important; }}
+    label p {{ font-weight: 600 !important; color: {COLORS['text_heading']} !important; }}
+    div[data-testid="stButton"] button {{
+        background-color: {COLORS['accent']} !important; color: {COLORS['accent_text']} !important;
+        border: 2px solid {COLORS['border']} !important; border-radius: 10px !important;
+        font-family: 'Inter', sans-serif !important; font-weight: 700 !important; font-size: 14px !important;
+        height: 48px !important; min-height: 48px !important; width: 100%;
+        box-shadow: 4px 4px 0px {COLORS['border']} !important; transition: all 0.2s ease !important;
+    }}
+    section[data-testid="stSidebar"] {{ background: {COLORS['bg_sidebar']} !important; border-right: 2px solid {COLORS['border']} !important; }}
+    .pn-card {{ background: {COLORS['bg_card']}; border: 2px solid {COLORS['border']}; border-radius: 14px; padding: 24px; box-shadow: 4px 4px 0px {COLORS['border_light']}; }}
+</style>
+""", unsafe_allow_html=True)
+
+for k, v in [("token", None), ("page", "Login"), ("reset_method", None), ("reset_stage", "start"), ("reset_email", ""), ("otp_token", "")]:
+    if k not in st.session_state: st.session_state[k] = v
+
+def navigate(p): st.session_state.page = p; st.rerun()
+
+def auth_header(title, sub="Intelligent Analytics Portal"):
+    st.markdown(f"""
+    <div style="text-align:center;padding:1.5rem 0 1rem;">
+        <div style="font-size:40px;margin-bottom:10px;">⚡</div>
+        <h1 style="font-size:2rem !important;margin:0;">Infosys Portal</h1>
+        <p style="color:{COLORS['text_muted']};font-size:14px;margin:4px 0 0;">{sub}</p>
+    </div>
+    <div style="text-align:center;margin-bottom:1.5rem;"><span style="font-size:1.1rem;font-weight:700;color:{COLORS['text_heading']};">{title}</span></div>
+    """, unsafe_allow_html=True)
+
+def generate_otp(): return f"{secrets.randbelow(900000) + 100000}"
+
+def make_otp_token(email, otp):
+    payload = {"sub": email, "otp_hash": bcrypt.hashpw(otp.encode(), bcrypt.gensalt()).decode(), "type": "password_reset_otp", "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=OTP_EXPIRY_MINUTES)}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def verify_otp_token(token, input_otp, email):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("sub") != email or payload.get("type") != "password_reset_otp": return False, "Security token mismatch."
+        if bcrypt.checkpw(input_otp.encode(), payload["otp_hash"].encode()): return True, "Valid"
+        return False, "Invalid 6-digit OTP code."
+    except jwt.ExpiredSignatureError: return False, f"⚠️ This OTP code expired after {OTP_EXPIRY_MINUTES} minutes."
+    except Exception: return False, "Invalid verification token."
+
+def send_professional_email(to_email, otp, app_pass):
+    if not SENDER_EMAIL or not app_pass:
+        return False, "Missing EMAIL_ADDRESS or EMAIL_PASSWORD in Colab Secrets."
+
+    msg = MIMEMultipart('alternative')
+    msg['From'] = f"Infosys Support <{SENDER_EMAIL}>"
+    msg['To'] = to_email
+    msg['Subject'] = "Infosys Portal - Verification Code"
+    msg['Date'] = formatdate(localtime=True)
+    msg['Message-ID'] = make_msgid()
+    msg['Reply-To'] = SENDER_EMAIL
+
+    text_body = f"Your verification code for Infosys Portal is: {otp}\nThis code will expire in {OTP_EXPIRY_MINUTES} minutes."
+    html_body = f"""
+    <!DOCTYPE html><html><body>
+    <div style="max-width:500px;margin:0 auto;background:#fff;border:2px solid #272343;border-radius:12px;padding:30px;text-align:center;">
+        <h3>Infosys Portal Verification</h3>
+        <p>Your code for <b>{to_email}</b> is:</p>
+        <div style="background:#ffd803;color:#272343;font-size:28px;font-weight:bold;letter-spacing:5px;padding:15px;border:2px solid #272343;border-radius:8px;display:inline-block;">{otp}</div>
+        <p>Expires in <b>{OTP_EXPIRY_MINUTES} minutes</b>.</p>
+    </div></body></html>
+    """
+    msg.attach(MIMEText(text_body, 'plain'))
+    msg.attach(MIMEText(html_body, 'html'))
+    try:
+        s = smtplib.SMTP('smtp.gmail.com', 587)
+        s.starttls()
+        s.login(SENDER_EMAIL, app_pass)
+        s.sendmail(SENDER_EMAIL, to_email, msg.as_string())
+        s.quit()
+        return True, "Email sent successfully!"
+    except Exception as e: return False, f"SMTP Error: {str(e)}"
+
+# ============================================================
+# PAGE ROUTING
+# ============================================================
+if not st.session_state.token:
+    if st.session_state.page not in ["Login", "Signup", "Forgot"]: st.session_state.page = "Login"
+    _, mid, _ = st.columns([1, 1.45, 1])
+    with mid:
+        # 1. LOGIN PAGE
+        if st.session_state.page == "Login":
+            auth_header("Sign in to your account")
+            email = st.text_input("Email address", placeholder="you@infosys.com").lower().strip()
+            pwd = st.text_input("Password", type="password", placeholder="••••••••")
+            st.markdown("<br>", unsafe_allow_html=True)
+            col_l, col_c, col_r = st.columns([1, 1.15, 1.3])
+            if col_l.button("Sign In →", use_container_width=True):
+                is_limited, wait_time = db.is_rate_limited(email)
+                if is_limited: st.error(f"⚠️ Too many failed attempts. Locked for {int(wait_time)}s.")
+                elif db.authenticate_user(email, pwd):
+                    st.session_state.token = jwt.encode({"email": email, "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=2)}, JWT_SECRET, algorithm="HS256")
+                    navigate("Dashboard")
+                else: st.error("❌ Invalid credentials.")
+            if col_c.button("Create Account", use_container_width=True): navigate("Signup")
+            if col_r.button("Forgot Password", use_container_width=True):
+                st.session_state.reset_stage = "start"
+                st.session_state.reset_method = None
+                navigate("Forgot")
+
+        # 2. SIGNUP PAGE (with Security Question)
+        elif st.session_state.page == "Signup":
+            auth_header("Create an account", "Join Infosys Portal today")
+            email = st.text_input("Email address", placeholder="you@infosys.com").lower().strip()
+            pwd = st.text_input("Password", type="password", placeholder="Min. 8 characters")
+            confirm_pwd = st.text_input("Confirm password", type="password", placeholder="Re-enter password")
+
+            sec_q = st.selectbox("Security Question", [
+                "What is your pet name?",
+                "What is your mother's maiden name?",
+                "What was your first school name?"
+            ])
+            sec_a = st.text_input("Security Answer", placeholder="Your security answer")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Create Account →", use_container_width=True):
+                if not email or len(pwd) < 8 or not sec_a.strip():
+                    st.error("⚠️ Please fill all fields including security answer (password min 8 chars).")
+                elif pwd != confirm_pwd:
+                    st.error("❌ Passwords do not match.")
+                elif db.check_user_exists(email):
+                    st.error("❌ Email already registered.")
+                else:
+                    if db.register_user(email, pwd, sec_q, sec_a):
+                        st.session_state.token = jwt.encode({"email": email, "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=2)}, JWT_SECRET, algorithm="HS256")
+                        st.success("✅ Account created!"); time.sleep(1); navigate("Dashboard")
+                    else: st.error("❌ Registration failed.")
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("← Back to Sign In", use_container_width=True): navigate("Login")
+
+        # 3. FORGOT PASSWORD PAGE (Dual Mode: Security Question OR OTP)
+        elif st.session_state.page == "Forgot":
+            auth_header("Reset your password", "Choose your verification method")
+
+            # Choose Method & Enter Email
+            if st.session_state.reset_stage == "start":
+                email_input = st.text_input("Registered email address", placeholder="you@infosys.com").lower().strip()
+                method = st.radio("Recovery Method", ["Security Question", "OTP via Email"])
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                if st.button("Proceed →", use_container_width=True):
+                    if not email_input:
+                        st.error("⚠️ Please enter your registered email address.")
+                    elif db.check_user_exists(email_input):
+                        st.session_state.reset_email = email_input
+                        st.session_state.reset_method = method
+
+                        if method == "Security Question":
+                            st.session_state.reset_stage = "sq_verify"
+                            st.rerun()
+                        else:  # OTP via Email
+                            otp = generate_otp()
+                            with st.spinner("Sending 6-digit OTP..."):
+                                ok, msg = send_professional_email(email_input, otp, EMAIL_PASSWORD)
+                            if ok:
+                                st.session_state.otp_token = make_otp_token(email_input, otp)
+                                st.session_state.reset_stage = "otp_verify"
+                                st.success("✅ OTP sent to email!"); time.sleep(1); st.rerun()
+                            else:
+                                st.error(f"❌ {msg}")
+                    else:
+                        st.error("❌ Email address not found.")
+
+            # Route A: Security Question Verification
+            elif st.session_state.reset_stage == "sq_verify":
+                sq_text = db.get_security_question(st.session_state.reset_email)
+                st.info(f"❓ **Security Question:** {sq_text}")
+                ans_input = st.text_input("Your Answer")
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                c1, c2 = st.columns(2)
+                if c1.button("Verify Answer →", use_container_width=True):
+                    if db.verify_security_answer(st.session_state.reset_email, ans_input):
+                        st.session_state.reset_stage = "new_password"
+                        st.success("✅ Answer verified!"); time.sleep(1); st.rerun()
+                    else:
+                        st.error("❌ Incorrect security answer.")
+                if c2.button("← Back", use_container_width=True):
+                    st.session_state.reset_stage = "start"; st.rerun()
+
+            # Route B: OTP Verification
+            elif st.session_state.reset_stage == "otp_verify":
+                st.info(f"📧 Code sent to **{st.session_state.reset_email}**")
+                otp_input = st.text_input("Enter 6-digit OTP", max_chars=6)
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                c1, c2 = st.columns(2)
+                if c1.button("Verify OTP →", use_container_width=True):
+                    ok, msg = verify_otp_token(st.session_state.otp_token, otp_input, st.session_state.reset_email)
+                    if ok:
+                        st.session_state.reset_stage = "new_password"
+                        st.success("✅ Code verified!"); time.sleep(1); st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+                if c2.button("← Back", use_container_width=True):
+                    st.session_state.reset_stage = "start"; st.rerun()
+
+            # Set New Password
+            elif st.session_state.reset_stage == "new_password":
+                npw = st.text_input("New password (min 8 chars)", type="password")
+                confirm_npw = st.text_input("Confirm new password", type="password")
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                if st.button("Update Password →", use_container_width=True):
+                    if len(npw) < 8: st.error("⚠️ Password must be at least 8 characters.")
+                    elif npw != confirm_npw: st.error("❌ Passwords do not match.")
+                    elif db.check_password_reused(st.session_state.reset_email, npw): st.error("❌ Password reuse prohibited.")
+                    else:
+                        db.update_password(st.session_state.reset_email, npw)
+                        st.success("🎉 Password updated successfully!"); time.sleep(1.5)
+                        st.session_state.reset_stage = "start"
+                        st.session_state.reset_email = ""
+                        navigate("Login")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("← Cancel & Return to Login", use_container_width=True):
+                st.session_state.reset_stage = "start"
+                st.session_state.reset_email = ""
+                navigate("Login")
+
+# ============================================================
+# DASHBOARD (ADMIN vs USER)
+# ============================================================
+else:
+    try: payload = jwt.decode(st.session_state.token, JWT_SECRET, algorithms=["HS256"])
+    except: payload = None
+    if not payload: st.session_state.token = None; navigate("Login")
+    email = payload["email"]
+    is_admin = (email == "admin@llm.com")
+
+    with st.sidebar:
+        st.markdown(f"""
+        <div style="padding:16px 8px;text-align:center;">
+            <div style="font-size:28px;">⚡</div>
+            <div style="font-weight:700;font-size:16px;color:{COLORS['text_heading']};">Infosys Portal</div>
+            <div style="font-size:11px;color:{COLORS['text_muted']};">{"Admin Panel" if is_admin else "Intelligent Analytics"}</div>
+        </div><hr style="border-color:{COLORS['border_light']};">
+        """, unsafe_allow_html=True)
+        opts = ["Dashboard", "Manage Users", "Logout"] if is_admin else ["Dashboard", "Analytics", "Reports", "Logout"]
+        menu = option_menu(None, opts, icons=["house", "people", "box-arrow-right"] if is_admin else ["house", "graph-up", "file-text", "box-arrow-right"],
+                           styles={"container": {"background-color": COLORS['bg_sidebar']}, "nav-link-selected": {"background-color": COLORS['accent'], "color": COLORS['accent_text']}})
+        if menu == "Logout": st.session_state.token = None; navigate("Login")
+
+    if is_admin:
+        st.markdown(f"""
+        <div style="background:{COLORS['text_heading']};border-radius:16px;padding:24px 32px;display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+            <div><h1 style="color:{COLORS['accent']} !important;margin:0;font-size:24px !important;">⚡ Infosys Portal</h1><div style="color:{COLORS['bg_card_alt']};font-size:13px;">Administrator Control Panel</div></div>
+            <div style="background:{COLORS['accent']};padding:8px 18px;border-radius:30px;font-weight:700;color:{COLORS['text_heading']};">🛡️ {email}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.subheader("📋 Registered Users List")
+        users = db.get_all_users()
+        if users: st.table([{"Email": u[0], "Created At": u[1]} for u in users])
+        else: st.info("No registered users found.")
+    else:
+        st.markdown(f"""
+        <div style="background:{COLORS['text_heading']};border-radius:16px;padding:24px 32px;display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
+            <div><h1 style="color:{COLORS['accent']} !important;margin:0;font-size:24px !important;">⚡ Infosys Portal</h1><div style="color:{COLORS['bg_card_alt']};font-size:13px;">Analytics Dashboard</div></div>
+            <div style="background:{COLORS['accent']};padding:8px 18px;border-radius:30px;font-weight:700;color:{COLORS['text_heading']};">👤 {email}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns(4)
+        for col, icon, lbl, val in [(c1, "📄", "Documents Indexed", "128"), (c2, "🔍", "Searches Today", "47"),
+                                    (c3, "📊", "Efficiency Score", "98.4%"), (c4, "🛡️", "Security Status", "Secured")]:
+            col.markdown(f"""
+            <div class="pn-card" style="text-align:center;">
+                <div style="font-size:28px;">{icon}</div>
+                <div style="font-size:26px;font-weight:700;color:{COLORS['text_heading']};">{val}</div>
+                <div style="color:{COLORS['text_muted']};font-size:12px;font-weight:600;">{lbl}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        fig = go.Figure(go.Indicator(mode="gauge+number", value=92, title={"text": "System Health Index", "font": {"color": COLORS['text_heading'], "size": 14}},
+                        gauge={"axis": {"range": [0, 100]}, "bar": {"color": COLORS['accent']}, "bgcolor": COLORS['bg_card_alt'], "borderwidth": 1, "bordercolor": COLORS['border']}))
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font={"color": COLORS['text_main'], "family": "Inter"}, height=260, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+import os
+import time
+import subprocess
+from pyngrok import ngrok
+from google.colab import userdata
+
+try:
+    os.environ['EMAIL_ADDRESS'] = userdata.get('EMAIL_ADDRESS')
+    os.environ['EMAIL_PASSWORD'] = userdata.get('EMAIL_PASSWORD')
+    NGROK_TOKEN = userdata.get('NGROK_AUTHTOKEN')
+    if NGROK_TOKEN:
+        ngrok.set_auth_token(NGROK_TOKEN)
+except Exception as e:
+    print(f"⚠️ Notice: Check Colab Secrets for EMAIL_ADDRESS, EMAIL_PASSWORD, and NGROK_AUTHTOKEN.")
+
+ngrok.kill()
+!pkill -f streamlit
+time.sleep(2)
+
+process = subprocess.Popen(
+    ["streamlit", "run", "app.py", "--server.port", "8501"],
+    env=os.environ.copy(),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL
+)
+time.sleep(3)
+
+public_url = ngrok.connect(8501).public_url
+print("=" * 60)
+print(f"🚀 Infosys Portal Live URL: {public_url}")
+print("=" * 60)
+
+============================================================
+🚀 Infosys Portal Live URL: https://glamour-unsigned-oval.ngrok-free.dev
+============================================================
